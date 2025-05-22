@@ -2,198 +2,216 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
+import os
+from src.utils import config, ProfessionalDigitClassifier, set_random_seeds
+from src.train import load_datasets, train_epoch, TrainingMetrics
+from src.eval import evaluate_model, create_professional_report
 import numpy as np
+import pandas as pd
 
-# Set device
+# ================================================================
+# REPRODUCIBILITY AND DEVICE CONFIGURATION
+# ================================================================
+set_random_seeds(42)
+
+# Configure device with CUDA optimization
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
+print(f"Device: {device}")
+if torch.cuda.is_available():
+    print(f"CUDA Device: {torch.cuda.get_device_name()}")
+    print(f"CUDA Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
 
-# Hyperparameters
-batch_size = 128
-learning_rate = 0.001
-epochs = 10
+# ================================================================
+# MAIN TRAINING AND EVALUATION PIPELINE
+# ================================================================
+def main():
+    """Main training and evaluation pipeline."""
 
-# Data preprocessing
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.1307,), (0.3081,))  # MNIST mean and std
-])
+    print("="*80)
+    print("PROFESSIONAL OCR RESEARCH: MNIST DIGIT CLASSIFICATION")
+    print("="*80)
 
-# Load datasets
-train_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
-test_dataset = datasets.MNIST('./data', train=False, transform=transform)
+    # ============ DATA PREPARATION ============
+    print("\n1. Loading and preparing datasets...")
+    train_loader, test_loader = load_datasets()
 
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    # ============ MODEL INITIALIZATION ============
+    print("\n2. Initializing model architecture...")
+    model = ProfessionalDigitClassifier(num_classes=10).to(device)
 
-# Neural network architecture
-class DigitClassifier(nn.Module):
-    def __init__(self):
-        super(DigitClassifier, self).__init__()
-        # Convolutional layers
-        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
-        self.pool = nn.MaxPool2d(2, 2)
-        self.dropout1 = nn.Dropout(0.25)
-        
-        # Fully connected layers
-        self.fc1 = nn.Linear(64 * 7 * 7, 128)
-        self.dropout2 = nn.Dropout(0.5)
-        self.fc2 = nn.Linear(128, 10)
-        
-    def forward(self, x):
-        # Convolutional layers with ReLU and pooling
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
-        x = self.dropout1(x)
-        
-        # Flatten for fully connected layers
-        x = x.view(-1, 64 * 7 * 7)
-        
-        # Fully connected layers
-        x = F.relu(self.fc1(x))
-        x = self.dropout2(x)
-        x = self.fc2(x)
-        
-        return F.log_softmax(x, dim=1)
+    # Print model summary
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
 
-# Initialize model, loss function, and optimizer
-model = DigitClassifier().to(device)
-criterion = nn.NLLLoss()
-optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    # ============ TRAINING SETUP ============
+    print("\n3. Setting up training infrastructure...")
 
-# Training function
-def train(model, device, train_loader, optimizer, criterion, epoch):
-    model.train()
-    train_loss = 0
-    correct = 0
-    total = 0
-    
-    for batch_idx, (data, target) in enumerate(train_loader):
-        data, target = data.to(device), target.to(device)
-        
-        # Zero gradients
-        optimizer.zero_grad()
-        
-        # Forward pass
-        output = model(data)
-        loss = criterion(output, target)
-        
-        # Backward pass and optimization
-        loss.backward()
-        optimizer.step()
-        
-        # Statistics
-        train_loss += loss.item()
-        pred = output.argmax(dim=1, keepdim=True)
-        correct += pred.eq(target.view_as(pred)).sum().item()
-        total += target.size(0)
-        
-        if batch_idx % 100 == 0:
-            print(f'Train Epoch: {epoch} [{batch_idx * len(data)}/{len(train_loader.dataset)} '
-                  f'({100. * batch_idx / len(train_loader):.0f}%)]\tLoss: {loss.item():.6f}')
-    
-    avg_loss = train_loss / len(train_loader)
-    accuracy = 100. * correct / total
-    return avg_loss, accuracy
+    # Loss function and optimizer
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)  # Label smoothing for better generalization
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=config.LEARNING_RATE,
+        weight_decay=config.WEIGHT_DECAY
+    )
 
-# Testing function
-def test(model, device, test_loader, criterion):
-    model.eval()
-    test_loss = 0
-    correct = 0
-    
-    with torch.no_grad():
-        for data, target in test_loader:
-            data, target = data.to(device), target.to(device)
-            output = model(data)
-            test_loss += criterion(output, target).item()
-            pred = output.argmax(dim=1, keepdim=True)
-            correct += pred.eq(target.view_as(pred)).sum().item()
-    
-    test_loss /= len(test_loader)
-    accuracy = 100. * correct / len(test_loader.dataset)
-    
-    print(f'\nTest set: Average loss: {test_loss:.4f}, '
-          f'Accuracy: {correct}/{len(test_loader.dataset)} ({accuracy:.2f}%)\n')
-    
-    return test_loss, accuracy
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=config.EPOCHS,
+        eta_min=config.LEARNING_RATE * 0.01
+    )
 
-# Training loop
-train_losses = []
-train_accuracies = []
-test_losses = []
-test_accuracies = []
+    # Metrics tracking
+    train_metrics = TrainingMetrics()
+    test_metrics = TrainingMetrics()
 
-print("Starting training...")
-for epoch in range(1, epochs + 1):
-    train_loss, train_acc = train(model, device, train_loader, optimizer, criterion, epoch)
-    test_loss, test_acc = test(model, device, test_loader, criterion)
-    
-    train_losses.append(train_loss)
-    train_accuracies.append(train_acc)
-    test_losses.append(test_loss)
-    test_accuracies.append(test_acc)
+    # ============ TRAINING LOOP ============
+    print(f"\n4. Training for {config.EPOCHS} epochs...")
 
-# Plot training results
-plt.figure(figsize=(12, 4))
+    best_test_acc = 0.0
+    best_model_state = None
 
-plt.subplot(1, 2, 1)
-plt.plot(train_losses, label='Train Loss')
-plt.plot(test_losses, label='Test Loss')
-plt.title('Loss over Epochs')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.legend()
+    for epoch in range(1, config.EPOCHS + 1):
+        print(f"\n--- Epoch {epoch}/{config.EPOCHS} ---")
 
-plt.subplot(1, 2, 2)
-plt.plot(train_accuracies, label='Train Accuracy')
-plt.plot(test_accuracies, label='Test Accuracy')
-plt.title('Accuracy over Epochs')
-plt.xlabel('Epoch')
-plt.ylabel('Accuracy (%)')
-plt.legend()
+        # Train for one epoch
+        train_loss, train_acc = train_epoch(
+            model, train_loader, optimizer, criterion, scheduler, device, epoch
+        )
 
-plt.tight_layout()
-plt.show()
+        # Evaluate on test set
+        test_loss, test_acc, _, _, _ = evaluate_model(
+            model, test_loader, criterion, device, "Test"
+        )
 
-# Test on a few sample images
-def visualize_predictions(model, test_loader, device, num_samples=8):
-    model.eval()
-    fig, axes = plt.subplots(2, 4, figsize=(12, 6))
-    axes = axes.ravel()
-    
-    with torch.no_grad():
-        data, target = next(iter(test_loader))
-        data, target = data.to(device), target.to(device)
-        output = model(data)
-        pred = output.argmax(dim=1)
-        
-        for i in range(num_samples):
-            image = data[i].cpu().squeeze()
-            true_label = target[i].cpu().item()
-            pred_label = pred[i].cpu().item()
-            
-            axes[i].imshow(image, cmap='gray')
-            color = 'green' if true_label == pred_label else 'red'
-            axes[i].set_title(f'True: {true_label}, Pred: {pred_label}', color=color)
-            axes[i].axis('off')
-    
+        # Update metrics
+        current_lr = scheduler.get_last_lr()[0]
+        train_metrics.update(train_loss, train_acc, current_lr)
+        test_metrics.update(test_loss, test_acc, current_lr)
+
+        # Save best model
+        if test_acc > best_test_acc:
+            best_test_acc = test_acc
+            best_model_state = model.state_dict().copy()
+            print(f"New best model! Test accuracy: {test_acc:.2f}%")
+
+    # ============ FINAL EVALUATION ============
+    print("\n5. Final evaluation with best model...")
+
+    # Load best model for final evaluation
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+
+    # Generate comprehensive performance report
+    final_metrics, confusion_mat, final_loss, final_acc = create_professional_report(
+        model, test_loader, device
+    )
+
+    # ============ RESULTS VISUALIZATION ============
+    print("\n6. Generating training visualizations...")
+
+    # Create directories for plots if they don't exist
+    os.makedirs('./data/plots', exist_ok=True)
+
+    plt.figure(figsize=(15, 5))
+
+    # Loss curves
+    plt.subplot(1, 3, 1)
+    epochs_range = range(1, len(train_metrics.losses) + 1)
+    plt.plot(epochs_range, train_metrics.losses, 'b-', label='Training Loss', linewidth=2)
+    plt.plot(epochs_range, test_metrics.losses, 'r-', label='Test Loss', linewidth=2)
+    plt.title('Loss Curves', fontsize=14, fontweight='bold')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.savefig('./data/plots/loss_curves.png')
+
+    # Accuracy curves
+    plt.subplot(1, 3, 2)
+    plt.plot(epochs_range, train_metrics.accuracies, 'b-', label='Training Accuracy', linewidth=2)
+    plt.plot(epochs_range, test_metrics.accuracies, 'r-', label='Test Accuracy', linewidth=2)
+    plt.title('Accuracy Curves', fontsize=14, fontweight='bold')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy (%)')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.savefig('./data/plots/accuracy_curves.png')
+
+    # Learning rate schedule
+    plt.subplot(1, 3, 3)
+    plt.plot(epochs_range, train_metrics.learning_rates, 'g-', linewidth=2)
+    plt.title('Learning Rate Schedule', fontsize=14, fontweight='bold')
+    plt.xlabel('Epoch')
+    plt.ylabel('Learning Rate')
+    plt.yscale('log')
+    plt.grid(True, alpha=0.3)
+    plt.savefig('./data/plots/learning_rate.png')
+
     plt.tight_layout()
-    plt.show()
+    plt.close() # Close the plot to free up memory
 
-# Visualize some predictions
-visualize_predictions(model, test_loader, device)
+    # ============ MODEL PERSISTENCE ============
+    print("\n7. Saving trained model...")
 
-# Save the trained model
-torch.save(model.state_dict(), 'digit_classifier.pth')
-print("Model saved as 'digit_classifier.pth'")
+    # Save complete model information
+    model_save_path = 'digit_classifier.pth'
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'config': config,
+        'final_test_accuracy': final_acc,
+        'final_test_loss': final_loss,
+        'epoch': config.EPOCHS,
+        'model_architecture': str(model)
+    }, model_save_path)
 
-# Print final results
-print(f"\nFinal Results:")
-print(f"Train Accuracy: {train_accuracies[-1]:.2f}%")
-print(f"Test Accuracy: {test_accuracies[-1]:.2f}%")
+    print(f"Model saved to: {model_save_path}")
+
+    # ============ SUMMARY REPORT ============
+    print("\n" + "="*80)
+    print("FINAL PERFORMANCE SUMMARY")
+    print("="*80)
+    print(f"Best Test Accuracy: {best_test_acc:.4f}%")
+    print(f"Final Test Accuracy: {final_acc:.4f}%")
+    print(f"Final Test Loss: {final_loss:.6f}")
+    print(f"Total Parameters: {total_params:,}")
+    print(f"Training Time: {config.EPOCHS} epochs")
+    print("="*80)
+
+    # Save summary report to data/reports
+    os.makedirs('./data/reports', exist_ok=True)
+    report_path = './data/reports/final_report.txt'
+    with open(report_path, 'w') as f:
+        f.write("="*80 + "\n")
+        f.write("FINAL PERFORMANCE SUMMARY\n")
+        f.write("="*80 + "\n")
+        f.write(f"Best Test Accuracy: {best_test_acc:.4f}%\n")
+        f.write(f"Final Test Accuracy: {final_acc:.4f}%\n")
+        f.write(f"Final Test Loss: {final_loss:.6f}\n")
+        f.write(f"Total Parameters: {total_params:,}\n")
+        f.write(f"Training Time: {config.EPOCHS} epochs\n")
+        f.write("="*80 + "\n")
+
+        f.write("\n" + "="*120 + "\n")
+        f.write("COMPREHENSIVE PERFORMANCE METRICS\n")
+        f.write("="*120 + "\n")
+        f.write(final_metrics.to_string(index=False) + "\n")
+
+        f.write("\n" + "="*60 + "\n")
+        f.write("CONFUSION MATRIX\n")
+        f.write("="*60 + "\n")
+        f.write("Rows: True Labels | Columns: Predicted Labels\n")
+        f.write(np.array2string(confusion_mat, separator=', ') + "\n")
+
+    print(f"\nSummary report saved to: {report_path}")
+
+# ================================================================
+# EXECUTION ENTRY POINT
+# ================================================================
+if __name__ == "__main__":
+    main()
